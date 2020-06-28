@@ -1,0 +1,117 @@
+import argparse
+import sys
+
+import torch.optim as optim
+
+import Model
+import data_generator
+
+from data_generator import *
+from Model import MarginLoss
+
+parser = argparse.ArgumentParser()
+parser.add_argument('-d', '--data', type=str, default='/home/C/LD/pycharm-projects/bugretrieval/data/')
+parser.add_argument('-k', '--top_k', type=int, default=25)
+parser.add_argument('-e', '--epochs', type=int, default=30)
+parser.add_argument('-nw', '--n_words', type=int, default=20000)
+parser.add_argument('-nc', '--n_chars', type=int, default=100)
+parser.add_argument('-wd', '--word_dim', type=int, default=300)
+parser.add_argument('-cd', '--char_dim', type=int, default=50)
+parser.add_argument('-nf', '--n_filters', type=int, default=64)
+parser.add_argument('-np', '--n_prop', type=int, default=651)
+parser.add_argument('-bs', '--batch_size', type=int, default=64)
+parser.add_argument('-nn', '--n_neg', type=int, default=1)
+parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3, metavar='LR',
+                    help='learning rate (default: 1e-3)')
+args = parser.parse_args()
+
+
+def train(epoch, net, optimizer):
+  print('Epoch: {}'.format(epoch))
+  net.train()
+  losses = []
+  margin = MarginLoss(margin=1.0)
+  for loop, (batch_x, batch_pos, batch_neg) in data_generator.batch_iterator(args.data, args.batch_size, args.n_neg):
+    pred_pos = net(batch_pos)
+    pred_neg = net(batch_neg)
+    pred = net(batch_x)
+    loss = margin(pred, pred_pos, pred_neg)
+    losses.append(loss.item())
+    loop.set_postfix(loss=loss.item())
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+  return np.array(losses).mean()
+
+
+def export(net, data):
+  _, bug_ids = read_test_data(data)
+  features = {}
+
+  batch_size = args.batch_size * args.n_neg
+  num_batch = int(len(bug_ids) / batch_size)
+  if len(bug_ids) % batch_size > 0:
+    num_batch += 1
+  loop = tqdm(range(num_batch))
+  loop.set_description('Exporting')
+  for i in loop:
+    batch_ids = []
+    for j in range(batch_size):
+      offset = batch_size * i + j
+      if offset >= len(bug_ids):
+        break
+      batch_ids.append(bug_ids[offset])
+    batch_features = net(read_batch_bugs(batch_ids, data, test=True))
+    for bug_id, feature in zip(batch_ids, batch_features):
+      features[bug_id] = feature
+  return features
+
+
+def test(data, top_k, features=None):
+  if not features:
+    features = torch.load(str(args.net) + '_features.t7')
+  cosine_batch = nn.CosineSimilarity(dim=1, eps=1e-6)
+  corrects = 0
+  total = 0
+  samples_ = torch.stack(list(features.values()))
+  test_data, _ = read_test_data(data)
+  loop = tqdm(range(len(test_data)))
+  loop.set_description('Testing')
+  for i in loop:
+    idx = test_data[i]
+    query = idx[0]
+    ground_truth = idx[1]
+
+    query_ = features[query].expand(samples_.size(0), samples_.size(1))
+    cos_ = cosine_batch(query_, samples_)
+
+    (_, indices) = torch.topk(cos_, k=top_k + 1)
+    candidates = [list(features.keys())[x.item()] for x in indices]
+
+    corrects += len(set(candidates) & set(ground_truth))
+    total += len(ground_truth)
+
+  return float(corrects) / total
+
+
+def main():
+  net = Model.BaseNet(args)
+  net.cuda()
+  optimizer = optim.Adam(net.parameters(), lr=args.learning_rate)
+  best_recall = 0
+  best_epoch = 0
+  for epoch in range(args.epochs):
+    loss = train(epoch, net, optimizer)
+    features = export(net, args.data)
+    recall = test(args.data, args.top_k, features)
+    print('Loss={:.4f}, Recall@{}={:.4f}'.format(loss, args.top_k, recall))
+    if recall > best_recall:
+      best_recall = recall
+      best_epoch = epoch
+      torch.save(net, str(args.net) + '_checkpoint.t7')
+      torch.save(features, str(args.net) + '_features.t7')
+  print('Best_epoch={}, Best_recall={:.4f}'.format(best_epoch, best_recall))
+
+
+if __name__ == "__main__":
+  main()
